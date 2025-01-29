@@ -6,12 +6,19 @@ from sandbox.config import settings
 from sandbox.scheduler.tasks import scheduler  # Import scheduler instance
 import os
 from pathlib import Path
+import logging
 from fastapi.responses import StreamingResponse
 import zipfile
 import io
 import tarfile
 
-router = APIRouter(prefix="/api/v1")
+logger = logging.getLogger(__name__)
+
+
+# Create routers for different endpoint groups
+sandbox_router = APIRouter(prefix="/api/v1/sandboxes", tags=["Sandboxes"])
+volume_router = APIRouter(prefix="/api/v1/volumes", tags=["Volumes"])
+metrics_router = APIRouter(prefix="/api/v1/metrics", tags=["Metrics"])
 
 # Validate settings
 if not hasattr(settings, 'DOMAIN'):
@@ -120,7 +127,7 @@ class EnvUpdate(BaseModel):
     environment: Dict[str, str]
     merge: bool = True  # If True, merge with existing env vars. If False, replace all
 
-@router.post("/sandboxes")
+@sandbox_router.post("", summary="Create Sandbox", description="Create a new sandbox container with specified image and volumes")
 async def create_sandbox(request: CreateSandboxRequest):
     """Create a new sandbox container with specified image and volumes"""
     try:
@@ -163,6 +170,7 @@ async def create_sandbox(request: CreateSandboxRequest):
         }
         ports = {}
         urls = {}
+        port_info = []
         
         if request.ports:
             for port in request.ports:
@@ -186,6 +194,13 @@ async def create_sandbox(request: CreateSandboxRequest):
                     })
                     
                     urls[str(port.port)] = f"https://{domain}"
+                    port_info.append({
+                        "id": len(port_info) + 1,
+                        "internal_port": port.port,
+                        "external_port": port.external or port.port,
+                        "protocol": port.protocol,
+                        "url": f"https://{domain}"
+                    })
 
         # Create container with volumes and Traefik config
         container_id = await docker_manager.create_container(
@@ -201,21 +216,53 @@ async def create_sandbox(request: CreateSandboxRequest):
         
         # Start container
         docker_manager.start_container(container_id)
+
+        # Get container info
+        container = docker_manager.client.containers.get(container_id)
         
+        # Convert volumes to VolumeInfo
+        volume_info = []
+        for vol_id, bind in volume_binds.items():
+            volume_info.append({
+                "id": len(volume_info) + 1,
+                "volume_id": vol_id,
+                "name": bind['bind'].split('/')[-1],
+                "mount_path": bind['bind'],
+                "size": 0,  # TODO: Get actual size
+                "driver": "local",
+                "created_at": container.attrs['Created']
+            })
+        
+        # Return SandboxStatus format
         return {
+            "id": 1,  # TODO: Use actual ID from DB
             "container_id": container_id,
-            "volumes": volume_binds,
+            "name": container.name,
+            "status": container.status,
+            "image": request.image,
+            "command": request.command,
+            "entrypoint": container.attrs.get('Config', {}).get('Entrypoint'),
+            "resources": request.resources.dict() if request.resources else {},
+            "environment": request.environment or {},
+            "created_at": container.attrs['Created'],
+            "started_at": container.attrs['State']['StartedAt'],
+            "terminated_at": None,
+            "last_active": container.attrs['Created'],
+            "auto_remove": True,
+            "volumes": volume_info,
+            "ports": port_info,
             "urls": urls
         }
         
     except Exception as e:
         # Cleanup volumes on failure
+        logger.exception(e)
         if 'volume_binds' in locals():
             for volume_id in volume_binds.keys():
                 await docker_manager.remove_docker_volume(volume_id)
         raise HTTPException(status_code=500, detail=str(e))
 
-@router.delete("/sandboxes/{sandbox_id}")
+@sandbox_router.delete("/{sandbox_id}", summary="Delete Sandbox", description="Delete a sandbox and its associated volumes")
 async def delete_sandbox(sandbox_id: str):
     """Delete a sandbox and its associated volumes"""
     try:
@@ -234,7 +281,7 @@ async def delete_sandbox(sandbox_id: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@router.get("/sandboxes/{sandbox_id}/volumes/{volume_id}/ls")
+@volume_router.get("/{sandbox_id}/{volume_id}/ls", summary="List Directory", description="List contents of a directory in the volume")
 async def list_directory(sandbox_id: str, volume_id: str, path: str = "/"):
     """List contents of a directory in the volume"""
     try:
@@ -252,7 +299,7 @@ async def list_directory(sandbox_id: str, volume_id: str, path: str = "/"):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@router.post("/sandboxes/{sandbox_id}/volumes/{volume_id}/mkdir")
+@sandbox_router.post("/{sandbox_id}/volumes/{volume_id}/mkdir")
 async def make_directory(sandbox_id: str, volume_id: str, path: str):
     """Create a directory in the volume"""
     try:
@@ -262,7 +309,7 @@ async def make_directory(sandbox_id: str, volume_id: str, path: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@router.get("/sandboxes/{sandbox_id}/volumes/{volume_id}/read")
+@sandbox_router.get("/{sandbox_id}/volumes/{volume_id}/read")
 async def read_file(sandbox_id: str, volume_id: str, path: str):
     """Read file content from the volume"""
     try:
@@ -276,7 +323,7 @@ async def read_file(sandbox_id: str, volume_id: str, path: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@router.post("/sandboxes/{sandbox_id}/volumes/{volume_id}/write")
+@sandbox_router.post("/{sandbox_id}/volumes/{volume_id}/write")
 async def write_file(
     sandbox_id: str, 
     volume_id: str, 
@@ -294,7 +341,7 @@ async def write_file(
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@router.post("/sandboxes/{sandbox_id}/volumes/{volume_id}/upload")
+@sandbox_router.post("/{sandbox_id}/volumes/{volume_id}/upload")
 async def upload_file(
     sandbox_id: str,
     volume_id: str,
@@ -316,7 +363,7 @@ async def upload_file(
 class ExecRequest(BaseModel):
     command: str
 
-@router.post("/sandboxes/{sandbox_id}/exec")
+@sandbox_router.post("/{sandbox_id}/exec")
 async def execute_command(sandbox_id: str, request: ExecRequest):
     """Execute a command in a sandbox container"""
     try:
@@ -325,7 +372,7 @@ async def execute_command(sandbox_id: str, request: ExecRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@router.post("/sandboxes/{sandbox_id}/exec/stream")
+@sandbox_router.post("/{sandbox_id}/exec/stream")
 async def stream_command(sandbox_id: str, request: ExecRequest):
     """Stream command output from a sandbox container"""
     try:
@@ -336,7 +383,7 @@ async def stream_command(sandbox_id: str, request: ExecRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@router.get("/sandboxes/{sandbox_id}")
+@sandbox_router.get("/{sandbox_id}")
 async def get_sandbox_status(sandbox_id: str):
     """Get detailed sandbox status"""
     try:
@@ -350,7 +397,7 @@ async def get_sandbox_status(sandbox_id: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@router.get("/sandboxes")
+@sandbox_router.get("/")
 async def list_sandboxes(status: Optional[str] = None):
     """List all sandboxes with optional status filter"""
     try:
@@ -361,7 +408,7 @@ async def list_sandboxes(status: Optional[str] = None):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@router.post("/sandboxes/{sandbox_id}/stop")
+@sandbox_router.post("/{sandbox_id}/stop")
 async def stop_sandbox(sandbox_id: str, timeout: Optional[int] = 10):
     """Stop a sandbox container"""
     try:
@@ -370,7 +417,7 @@ async def stop_sandbox(sandbox_id: str, timeout: Optional[int] = 10):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@router.post("/sandboxes/{sandbox_id}/start")
+@sandbox_router.post("/{sandbox_id}/start")
 async def start_sandbox(sandbox_id: str):
     """Start a stopped sandbox container"""
     try:
@@ -379,7 +426,7 @@ async def start_sandbox(sandbox_id: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@router.post("/sandboxes/{sandbox_id}/restart")
+@sandbox_router.post("/{sandbox_id}/restart")
 async def restart_sandbox(sandbox_id: str, timeout: Optional[int] = 10):
     """Restart a sandbox container"""
     try:
@@ -395,7 +442,7 @@ class NetworkVolumeRequest(BaseModel):
     size: Optional[str] = None
     mount_path: Optional[str] = None
 
-@router.post("/volumes/network")
+@volume_router.post("/network")
 async def create_network_volume(request: NetworkVolumeRequest):
     """Create a new network volume"""
     try:
@@ -408,7 +455,7 @@ async def create_network_volume(request: NetworkVolumeRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@router.post("/sandboxes/{sandbox_id}/volumes/{volume_name}/mount")
+@sandbox_router.post("/{sandbox_id}/volumes/{volume_name}/mount")
 async def mount_volume(sandbox_id: str, volume_name: str, mount_path: str):
     """Mount a network volume to a sandbox"""
     try:
@@ -417,7 +464,7 @@ async def mount_volume(sandbox_id: str, volume_name: str, mount_path: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@router.post("/sandboxes/{sandbox_id}/volumes/{volume_name}/unmount")
+@sandbox_router.post("/{sandbox_id}/volumes/{volume_name}/unmount")
 async def unmount_volume(sandbox_id: str, volume_name: str):
     """Unmount a network volume from a sandbox"""
     try:
@@ -426,7 +473,7 @@ async def unmount_volume(sandbox_id: str, volume_name: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@router.get("/sandboxes/{sandbox_id}/urls")
+@sandbox_router.get("/{sandbox_id}/urls")
 async def get_sandbox_urls(sandbox_id: str):
     """Get all URLs for a sandbox's exposed ports"""
     try:
@@ -440,7 +487,7 @@ class NetworkRequest(BaseModel):
     driver: Optional[str] = "bridge"
     labels: Optional[Dict[str, str]] = None
 
-@router.post("/networks")
+@volume_router.post("/network")
 async def create_network(request: NetworkRequest):
     """Create a new network"""
     try:
@@ -453,7 +500,7 @@ async def create_network(request: NetworkRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@router.post("/sandboxes/{sandbox_id}/networks/{network_name}/connect")
+@sandbox_router.post("/{sandbox_id}/networks/{network_name}/connect")
 async def connect_to_network(sandbox_id: str, network_name: str):
     """Connect sandbox to network"""
     try:
@@ -462,7 +509,7 @@ async def connect_to_network(sandbox_id: str, network_name: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@router.post("/sandboxes/{sandbox_id}/networks/{network_name}/disconnect")
+@sandbox_router.post("/{sandbox_id}/networks/{network_name}/disconnect")
 async def disconnect_from_network(sandbox_id: str, network_name: str):
     """Disconnect sandbox from network"""
     try:
@@ -474,7 +521,7 @@ async def disconnect_from_network(sandbox_id: str, network_name: str):
 class TimeoutUpdate(BaseModel):
     timeout: int = Field(ge=0, description="Timeout in seconds (0 for no timeout)")
 
-@router.post("/sandboxes/{sandbox_id}/timeout")
+@sandbox_router.post("/{sandbox_id}/timeout")
 async def update_timeout(sandbox_id: str, request: TimeoutUpdate):
     """Update sandbox timeout"""
     try:
@@ -483,18 +530,18 @@ async def update_timeout(sandbox_id: str, request: TimeoutUpdate):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@router.get("/sandboxes/{sandbox_id}/stats")
+@metrics_router.get("/{sandbox_id}")
 async def get_sandbox_stats(sandbox_id: str):
     """Get sandbox resource usage stats"""
     try:
-        stats = await docker_manager.get_container_stats(sandbox_id)
+        stats = await docker_manager.get_container_stats_async(sandbox_id)
         if not stats:
             raise HTTPException(status_code=404, detail="Stats not available")
         return stats
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@router.post("/sandboxes/{sandbox_id}/entrypoint")
+@sandbox_router.post("/{sandbox_id}/entrypoint")
 async def update_entrypoint(sandbox_id: str, request: EntrypointUpdate):
     """Update container entrypoint and/or command"""
     try:
@@ -522,7 +569,7 @@ async def update_entrypoint(sandbox_id: str, request: EntrypointUpdate):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@router.post("/sandboxes/{sandbox_id}/env")
+@sandbox_router.post("/{sandbox_id}/env")
 async def update_environment(sandbox_id: str, request: EnvUpdate):
     """Update container environment variables"""
     try:
@@ -557,7 +604,7 @@ async def update_environment(sandbox_id: str, request: EnvUpdate):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@router.get("/sandboxes/{sandbox_id}/env")
+@sandbox_router.get("/{sandbox_id}/env")
 async def get_environment(sandbox_id: str):
     """Get container environment variables"""
     try:
@@ -574,7 +621,7 @@ async def get_environment(sandbox_id: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@router.get("/sandboxes/{sandbox_id}/entrypoint")
+@sandbox_router.get("/{sandbox_id}/entrypoint")
 async def get_entrypoint(sandbox_id: str):
     """Get container entrypoint and command"""
     try:
@@ -588,7 +635,7 @@ async def get_entrypoint(sandbox_id: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@router.get("/sandboxes/{sandbox_id}/export")
+@sandbox_router.get("/{sandbox_id}/export")
 async def export_container_folder(sandbox_id: str, folder_path: str = "/"):
     """Export a container folder as zip file"""
     try:
@@ -635,4 +682,10 @@ async def export_container_folder(sandbox_id: str, folder_path: str = "/"):
             }
         )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e)) 
+        raise HTTPException(status_code=500, detail=str(e))
+
+# Combine routers
+router = APIRouter()
+router.include_router(sandbox_router)
+router.include_router(volume_router)
+router.include_router(metrics_router) 

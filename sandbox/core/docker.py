@@ -12,18 +12,36 @@ logger = logging.getLogger(__name__)
 
 class DockerManager:
     def __init__(self):
-        self.client = docker.from_env(version=DOCKER_API_VERSION)
+        try:
+            # Try using direct socket connection first
+            self.client = docker.DockerClient(
+                base_url='unix:///var/run/docker.sock',
+                version='auto',
+                use_ssh_client=False
+            )
+            logger.info("Connected to Docker using Unix socket")
+        except Exception as e:
+            logger.error(f"Failed to connect to Docker daemon: {str(e)}")
+            raise
+        
         self.volumes_root = Path(settings.VOLUMES_ROOT)
         
     async def initialize(self):
         """Initialize Docker manager and ensure network exists"""
         try:
-            await self.ensure_network(
+            # Test connection
+            self.client.ping()
+            logger.info("Successfully pinged Docker daemon")
+            
+            # Ensure network exists
+            network_id = await self.ensure_network(
                 "traefik-net",
+                driver="bridge",
                 labels={
                     "traefik.enable": "true"
                 }
             )
+            logger.info(f"Ensured network traefik-net exists with ID: {network_id}")
             return True
         except Exception as e:
             logger.error(f"Failed to initialize Docker manager: {str(e)}")
@@ -54,35 +72,65 @@ class DockerManager:
     ) -> str:
         """Create a new container"""
         try:
-            # Merge resource limits with host config
-            config = self._prepare_host_config(resources)
-            if host_config:
-                config.update(host_config)
-            
-            # Add port bindings
+            # Convert resources to Docker API parameters
+            if resources:
+                if hasattr(resources, 'dict'):
+                    resources = resources.dict()
+                    
+                mem_limit = resources.get("memory", "512m")
+                cpu_quota = int(resources.get("cpu", 1) * 100000)
+                pids_limit = resources.get("pids", 100)
+            else:
+                mem_limit = "512m"
+                cpu_quota = 100000
+                pids_limit = 100
+
+            # Prepare port bindings and exposed ports
+            port_bindings = {}
+            exposed_ports = {}
             if ports:
-                config["port_bindings"] = ports
-                
-            # Add network
-            if network:
-                config["network_mode"] = network
-                
-            container = self.client.containers.create(
+                for port_spec, host_port in ports.items():
+                    exposed_ports[port_spec] = {}
+                    port_bindings[port_spec] = [{"HostPort": str(host_port)}]
+
+            # Create host config
+            host_config_params = {
+                "mem_limit": mem_limit,
+                "cpu_quota": cpu_quota,
+                "cpu_period": 100000,
+                "pids_limit": pids_limit,
+                "network_mode": network or "traefik-net",
+                "port_bindings": port_bindings
+            }
+            
+            # Add volume bindings if present
+            if host_config and 'binds' in host_config:
+                host_config_params['binds'] = host_config['binds']
+
+            # Create container with proper parameters using low-level API
+            container = self.client.api.create_container(
                 image=image,
                 command=command,
                 environment=environment,
-                host_config=self.client.api.create_host_config(**config),
                 labels=labels,
-                ports=list(ports.keys()) if ports else None,
+                host_config=self.client.api.create_host_config(**host_config_params),
+                ports=list(exposed_ports.keys()) if exposed_ports else None,
                 detach=True
             )
-            return container.id
+            
+            return container['Id']
         except APIError as e:
+            logger.error(f"Failed to create container: {str(e)}")
             raise RuntimeError(f"Failed to create container: {str(e)}")
 
     def _prepare_host_config(self, resources: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """Prepare container host config with resource limits"""
-        resources = resources or {}
+        if resources is None:
+            resources = {}
+            
+        # Convert Pydantic model to dict if needed
+        if hasattr(resources, 'dict'):
+            resources = resources.dict()
         
         return {
             "mem_limit": resources.get("memory", "512m"),
@@ -146,15 +194,91 @@ class DockerManager:
         """Get container status"""
         try:
             container = self.client.containers.get(container_id)
+            # Parse dates safely
+            started_at = container.attrs['State'].get('StartedAt', '')
+            finished_at = container.attrs['State'].get('FinishedAt', '')
+            
+            # Handle timezone format
+            def format_date(date_str: str) -> str:
+                if not date_str or date_str == "0001-01-01T00:00:00Z":
+                    return ""
+                try:
+                    # Remove nanoseconds and normalize timezone
+                    if "." in date_str:
+                        date_str = date_str.split(".")[0]
+                    if "+" in date_str:
+                        date_str = date_str.split("+")[0]
+                    return date_str + "Z"
+                except Exception:
+                    return ""
+                
             return {
                 "status": container.status,
                 "running": container.status == "running",
                 "exit_code": container.attrs['State'].get('ExitCode'),
-                "started_at": container.attrs['State'].get('StartedAt'),
-                "finished_at": container.attrs['State'].get('FinishedAt')
+                "started_at": format_date(started_at),
+                "finished_at": format_date(finished_at)
             }
         except APIError as e:
             raise RuntimeError(f"Failed to get container status: {str(e)}")
+
+    async def get_container_stats_async(self, container_id: str) -> Dict[str, Any]:
+        """Async wrapper for get_container_stats"""
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, self.get_container_stats, container_id)
+
+    def get_container_stats(self, container_id: str) -> Dict[str, Any]:
+        """Get container resource usage statistics"""
+        try:
+            container = self.client.containers.get(container_id)
+            stats = container.stats(stream=False)
+            
+            # Calculate CPU percentage safely
+            cpu_percent = 0.0
+            try:
+                cpu_stats = stats.get("cpu_stats", {})
+                precpu_stats = stats.get("precpu_stats", {})
+                
+                cpu_usage = cpu_stats.get("cpu_usage", {})
+                precpu_usage = precpu_stats.get("cpu_usage", {})
+                
+                cpu_delta = cpu_usage.get("total_usage", 0) - precpu_usage.get("total_usage", 0)
+                system_delta = cpu_stats.get("system_cpu_usage", 0) - precpu_stats.get("system_cpu_usage", 0)
+                
+                if system_delta > 0 and cpu_usage.get("percpu_usage"):
+                    cpu_percent = (cpu_delta / system_delta) * len(cpu_usage["percpu_usage"]) * 100.0
+            except (KeyError, TypeError, ZeroDivisionError) as e:
+                logger.warning(f"Error calculating CPU stats: {e}")
+
+            # Memory usage in bytes safely
+            memory_stats = stats.get("memory_stats", {})
+            mem_usage = memory_stats.get("usage", 0)
+            mem_limit = memory_stats.get("limit", 0)
+            mem_percent = (mem_usage / mem_limit) * 100.0 if mem_limit > 0 else 0.0
+            
+            # Network stats safely
+            networks = stats.get("networks", {})
+            net_rx = networks.get("eth0", {}).get("rx_bytes", 0)
+            net_tx = networks.get("eth0", {}).get("tx_bytes", 0)
+            
+            return {
+                "cpu_percent": round(cpu_percent, 2),
+                "mem_usage": mem_usage,
+                "mem_limit": mem_limit,
+                "mem_percent": round(mem_percent, 2),
+                "net_rx": net_rx,
+                "net_tx": net_tx
+            }
+        except Exception as e:
+            logger.error(f"Failed to get container stats: {str(e)}")
+            return {
+                "cpu_percent": 0,
+                "mem_usage": 0,
+                "mem_limit": 0,
+                "mem_percent": 0,
+                "net_rx": 0,
+                "net_tx": 0
+            }
 
     def get_volume_path(self, sandbox_id: str, volume_id: str, path: str = "/") -> str:
         """Get absolute path for a volume path"""
@@ -399,8 +523,10 @@ class DockerManager:
         try:
             try:
                 network = self.client.networks.get(name)
+                logger.info(f"Found existing network: {name}")
                 return network.id
             except APIError:
+                logger.info(f"Creating new network: {name}")
                 network = self.client.networks.create(
                     name=name,
                     driver=driver,
@@ -410,6 +536,7 @@ class DockerManager:
                 )
                 return network.id
         except APIError as e:
+            logger.error(f"Failed to ensure network: {str(e)}")
             raise RuntimeError(f"Failed to ensure network: {str(e)}")
 
     async def connect_to_network(self, container_id: str, network_name: str) -> None:

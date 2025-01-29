@@ -3,11 +3,12 @@ from sandbox.client import SandboxClient, CreateSandboxRequest, ResourceConfig, 
 
 async def main():
     # Initialize client
-    async with SandboxClient("http://localhost:8000") as client:
+    async with SandboxClient("http://34.132.186.142:8000/api/v1",  # Base URL with /api/v1
+                             timeout=1000) as client:
         # Create sandbox request
         request = CreateSandboxRequest(
             image="newdev00/pack-nextjs-shadcn:latest",
-            command="cd frontend && npm install --force && npm run dev",
+            command="/bin/sh -c 'cd frontend && npm install --force && npm run dev'",  # Wrap in shell
             ports=[
                 PortConfig(
                     port=3000,  # Next.js default port

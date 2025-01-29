@@ -93,6 +93,8 @@ class SandboxClient:
         """Create a new sandbox container"""
         try:
             response = await self.client.post(self._url("/sandboxes"), json=request.dict(exclude_none=True))
+            print(response.json())
+
             response.raise_for_status()
             return SandboxStatus(**response.json())
         except httpx.TimeoutException as e:

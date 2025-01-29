@@ -149,7 +149,4 @@ class SandboxStatus(BaseModel):
     last_active: datetime
     auto_remove: bool
     volumes: List[VolumeInfo]
-    ports: List[PortInfo]
-
-# Update forward refs for nested models
-SandboxStatus.update_forward_refs(VolumeInfo=VolumeInfo, PortInfo=PortInfo) 
+    ports: List[PortInfo] 
